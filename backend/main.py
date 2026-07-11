@@ -77,6 +77,10 @@ def normalize_url(raw_url: str) -> str | None:
     if "duckduckgo.com" in parsed.netloc:
         raw_url = parse_qs(parsed.query).get("uddg", [""])[0]
         parsed = urlparse(raw_url)
+    # Relative links (e.g. href="/topic/123") returned directly by NodeBB pages
+    # have no scheme/netloc; treat them as belonging to TARGET_HOST.
+    if not parsed.netloc and parsed.path.startswith("/"):
+        parsed = urlparse(f"https://{TARGET_HOST}{raw_url}")
     host = parsed.hostname.lower().removeprefix("www.") if parsed.hostname else ""
     if host != TARGET_HOST or parsed.scheme not in {"http", "https"}:
         return None
@@ -123,13 +127,14 @@ def _request_with_retry(session: requests.Session, method: str, url: str, **kwar
         try:
             response = session.request(method, url, headers=headers(), timeout=REQUEST_TIMEOUT, **kwargs)
             if response.status_code in {429, 500, 502, 503, 504}:
-                raise requests.HTTPError(f"upstream status {response.status_code}")
+                raise requests.HTTPError(f"upstream status {response.status_code} for {url}")
             response.raise_for_status()
             return response
         except requests.RequestException as exc:
             error = exc
+            log.warning("Attempt %d failed for %s: %s", attempt + 1, url, exc)
             if attempt < 2:
-                time.sleep(0.35 * (2**attempt) + random.random() * 0.15)
+                time.sleep(0.35 * (2 ** attempt) + random.random() * 0.15)
     raise requests.RequestException(str(error or "upstream request failed"))
 
 
@@ -208,20 +213,49 @@ def run_search(payload: SearchRequest) -> dict[str, Any]:
     session = requests.Session()
     groups: list[tuple[str, list[dict[str, str]]]] = []
     errors: list[str] = []
+    attempts = 0
     start_page = payload.page
     for query in payload.queries:
         for page in range(start_page, min(MAX_PAGES, start_page + payload.pages_per_query - 1) + 1):
             combined: list[dict[str, str]] = []
             for provider in (search_site, search_duckduckgo):
+                attempts += 1
                 try:
                     combined.extend(provider(session, query, page))
-                except requests.RequestException:
-                    errors.append(provider.__name__)
+                except requests.RequestException as exc:
+                    error_detail = f"{provider.__name__}: {exc}"
+                    errors.append(error_detail)
+                    log.error("Provider failed [%s] query=%r page=%d -> %s", provider.__name__, query, page, exc)
             groups.append((query, combined))
     results = merge_results(groups, payload.queries)
     sliced = results[: payload.limit]
     next_page = payload.page + payload.pages_per_query
     has_more = next_page <= MAX_PAGES and bool(results)
+
+    # If every single provider call failed, this isn't "no results" — it's a
+    # genuine upstream failure and must be reported as such instead of a
+    # silent success:true with an empty array.
+    if attempts > 0 and len(errors) == attempts:
+        log.error("All %d provider calls failed. Errors: %s", attempts, errors)
+        return {
+            "success": False,
+            "results": [],
+            "error": {
+                "code": "ALL_PROVIDERS_FAILED",
+                "message": "שרת החיפוש לא הצליח לגשת לאף מקור מידע. נסו שוב מאוחר יותר.",
+                "details": errors,
+            },
+            "meta": {
+                "queries": payload.queries,
+                "count": 0,
+                "uniqueCollected": 0,
+                "page": payload.page,
+                "hasMore": False,
+                "nextPage": None,
+                "partial": False,
+            },
+        }
+
     return {
         "success": True,
         "results": sliced,
@@ -233,6 +267,7 @@ def run_search(payload: SearchRequest) -> dict[str, Any]:
             "hasMore": has_more,
             "nextPage": next_page if has_more else None,
             "partial": bool(errors),
+            "errors": errors if errors else None,
         },
     }
 
