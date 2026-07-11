@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import random
 import re
 import time
@@ -41,11 +40,22 @@ app.add_middleware(
 )
 
 
+class ClientTopic(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    url: str = Field(min_length=1, max_length=500)
+    snippet: str = Field(default="", max_length=500)
+
+
 class SearchRequest(BaseModel):
     queries: list[str] = Field(min_length=1, max_length=MAX_QUERIES)
     page: int = Field(default=1, ge=1, le=MAX_PAGES)
     pages_per_query: int = Field(default=1, ge=1, le=2)
     limit: int = Field(default=30, ge=1, le=MAX_RESULTS)
+    # Results the client already scraped from mitmachim.top itself, using the
+    # user's own authenticated session in the browser. This avoids the server
+    # (Vercel) making outbound requests to the forum, which can be blocked by
+    # bot-detection/firewalls in front of the forum.
+    client_topics: list[ClientTopic] = Field(default_factory=list, max_length=200)
 
     @field_validator("queries")
     @classmethod
@@ -215,10 +225,28 @@ def run_search(payload: SearchRequest) -> dict[str, Any]:
     errors: list[str] = []
     attempts = 0
     start_page = payload.page
+
+    # Client-supplied NodeBB results (scraped in-browser with the user's own
+    # session/cookies) take priority: they don't get blocked by bot-detection
+    # in front of the forum the way server-side scraping does.
+    client_found: list[dict[str, str]] = []
+    if payload.client_topics:
+        for topic in payload.client_topics:
+            normalized = normalize_url(topic.url)
+            if not normalized:
+                continue
+            client_found.append({
+                "title": topic.title,
+                "url": normalized,
+                "snippet": topic.snippet,
+                "source": "Mitmachim Top",
+            })
+
     for query in payload.queries:
         for page in range(start_page, min(MAX_PAGES, start_page + payload.pages_per_query - 1) + 1):
-            combined: list[dict[str, str]] = []
-            for provider in (search_site, search_duckduckgo):
+            combined: list[dict[str, str]] = list(client_found) if client_found else []
+            providers = (search_duckduckgo,) if client_found else (search_site, search_duckduckgo)
+            for provider in providers:
                 attempts += 1
                 try:
                     combined.extend(provider(session, query, page))
@@ -234,8 +262,9 @@ def run_search(payload: SearchRequest) -> dict[str, Any]:
 
     # If every single provider call failed, this isn't "no results" — it's a
     # genuine upstream failure and must be reported as such instead of a
-    # silent success:true with an empty array.
-    if attempts > 0 and len(errors) == attempts:
+    # silent success:true with an empty array. (Client-supplied topics count
+    # as success even if DuckDuckGo also fails, since we still have data.)
+    if attempts > 0 and len(errors) == attempts and not client_found:
         log.error("All %d provider calls failed. Errors: %s", attempts, errors)
         return {
             "success": False,
