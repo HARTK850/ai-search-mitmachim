@@ -11,6 +11,8 @@
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @connect      generativelanguage.googleapis.com
+// @connect      mitmachim.top
+// @connect      html.duckduckgo.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -80,8 +82,19 @@
             headers: { 'Content-Type': 'application/json' },
             data: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.25 } })
           });
-          if ([403, 429].includes(response.status) || response.status >= 500) throw new Error(`Gemini ${response.status}`);
-          if (response.status >= 400) throw new Error('מפתח Gemini אינו תקין');
+          if (response.status === 400) {
+            let msg = 'מפתח Gemini — בקשה לא תקינה (400)';
+            try { const e = JSON.parse(response.responseText); msg = e?.error?.message || msg; } catch (_) {}
+            throw new Error(msg);
+          }
+          if (response.status === 401 || response.status === 403) {
+            let msg = 'מפתח Gemini אינו תקין או אין הרשאה (403)';
+            try { const e = JSON.parse(response.responseText); msg = e?.error?.message || msg; } catch (_) {}
+            throw new Error(msg);
+          }
+          if (response.status === 429) throw new Error('Gemini — חרגתם ממגבלת הקצב, נסו שוב עוד רגע');
+          if (response.status >= 500) throw new Error(`Gemini שגיאת שרת (${response.status})`);
+          if (response.status >= 400) throw new Error(`Gemini שגיאה (${response.status})`);
           this.index = (index + 1) % this.keys.length; GM_setValue('mitmachim-ai-key-index', this.index);
           const payload = JSON.parse(response.responseText);
           return cleanJson(payload.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('') || '');
@@ -92,7 +105,17 @@
   }
 
   async function planSearch(query, keyManager, signal) {
-    return keyManager.call(`אתה מתכנן חיפוש בפורום הטכנולוגיה החרדי mitmachim.top. עבור השאלה: "${query}" החזר JSON בלבד: {"queries":[3 עד 8 שאילתות עברית קצרות ומגוונות, ללא site:],"possibleTitles":[עד 5 כותרות אפשריות],"synonyms":[עד 8 מילים]}. אל תענה על השאלה.`, signal);
+    return keyManager.call(
+      `אתה עוזר לחיפוש בפורום הטכנולוגיה החרדי mitmachim.top.
+המשימה שלך: צור שאילתות חיפוש קצרות ומדויקות לאיתור אשכולות קיימים בפורום שעונים על השאלה: "${query}"
+
+כללים חשובים:
+- החזר ONLY JSON, ללא הסברים
+- queries: 3-6 שאילתות עבריות קצרות (2-4 מילים כל אחת), מגוונות, ישירות לנושא
+- possibleTitles: עד 4 כותרות אשכול שסביר למצוא בפורום
+- אל תמציא מידע, אל תענה על השאלה, רק תכנן חיפוש
+- שאילתות צריכות להיות מילות מפתח בלבד, לא משפטים
+פורמט: {"queries":["..."],"possibleTitles":["..."]}`, signal);
   }
 
   async function explainResults(query, results, keyManager, signal) {
@@ -113,8 +136,9 @@ ${compact}`, signal);
   }
 
   function canonicalKey(url) {
-    const m = url.match(/\/post\/(\d+)/);
-    return m ? `post:${m[1]}` : url.toLowerCase().replace(/\/+$/, '');
+    const m = url.match(/\/(?:post|topic)\/(\d+)/);
+    const type = url.includes('/topic/') ? 'topic' : 'post';
+    return m ? `${type}:${m[1]}` : url.toLowerCase().replace(/\/+$/, '');
   }
 
   function relevanceScore(item, queries) {
@@ -129,7 +153,7 @@ ${compact}`, signal);
       score += titleOverlap * 55 + snippetOverlap * 24;
       if (item.title.toLowerCase().includes(q.toLowerCase())) score += 18;
     }
-    if (item.url.includes('/post/')) score += 8;
+    if (item.url.includes('/post/') || item.url.includes('/topic/')) score += 8;
     score += Math.min(matchedQueries, 4) * 7;
     return Math.round(score * 100) / 100;
   }
@@ -161,13 +185,16 @@ ${compact}`, signal);
     return out.sort((a, b) => b.score - a.score || a.title.localeCompare(b.title));
   }
 
-  // Searches mitmachim.top NodeBB /search directly from the browser.
-  // Same-origin fetch => user session/cookies included automatically.
+  // Searches mitmachim.top via GM_xmlhttpRequest (avoids NetFree 418 block).
   async function forumSearch(query, page) {
     try {
-      const res = await fetch(`/search?term=${encodeURIComponent(query)}&in=titlesposts&matchWords=all&showAs=posts&sortBy=relevance&sortDirection=desc&page=${page}`, { credentials: 'same-origin' });
-      if (!res.ok) return [];
-      const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+      const res = await request({
+        method: 'GET',
+        url: `https://mitmachim.top/search?term=${encodeURIComponent(query)}&in=titlesposts&matchWords=all&showAs=posts&sortBy=relevance&sortDirection=desc&page=${page}`,
+        headers: { 'Accept': 'text/html', 'Accept-Language': 'he-IL,he;q=0.9' }
+      });
+      if (res.status !== 200) return [];
+      const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
       const seen = new Set(); const found = [];
       // תוצאות החיפוש נמצאות ב-#results > ul > li[component="post"]
       for (const li of doc.querySelectorAll('#results li[component="post"]')) {
@@ -405,7 +432,7 @@ ${recentQueries.length ? `
     body.innerHTML = `<div class="d-flex flex-column gap-3">
 <h3 class="fw-semibold tracking-tight mb-0">הגדרות חיפוש AI</h3>
 <label class="d-flex flex-column gap-1 text-sm">הוספת מפתח Gemini
-<input class="form-control py-2 ps-2 pe-3" id="mai-new-key" type="password" dir="ltr" autocomplete="off" placeholder="AIza...">
+<input class="form-control py-2 ps-2 pe-3" id="mai-new-key" type="password" dir="ltr" autocomplete="off" placeholder="הדביקו את המפתח כאן (AIza... / AQ.../ וכו׳)">
 </label>
 <button class="btn btn-primary fw-semibold align-self-start px-3" id="mai-add-key">הוספת מפתח</button>
 <div id="mai-keys" class="d-flex flex-column gap-2">${settings.keys.map((key, index) => `<div class="d-flex align-items-center gap-2 border-top pt-2"><code class="text-sm">${escapeHtml(maskKey(key))}</code><button class="btn btn-light btn-sm border text-danger" data-remove="${index}">מחיקה</button></div>`).join('') || '<p class="text-muted text-sm mb-0">עדיין לא נשמרו מפתחות.</p>'}</div>
@@ -417,7 +444,7 @@ ${recentQueries.length ? `
     body.querySelector('#mai-add-key').addEventListener('click', () => {
       const input = body.querySelector('#mai-new-key');
       const key = input.value.trim();
-      if (!/^AIza[\w-]{20,}$/.test(key)) return alert('מבנה המפתח אינו תקין');
+      if (key.length < 10 || /\s/.test(key)) return alert('המפתח אינו תקין — ודאו שהעתקתם אותו במלואו ללא רווחים');
       storage.update({ keys: [...settings.keys, key] });
       renderSettings();
     });
