@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         חיפוש AI למתמחים טופ
 // @namespace    https://mitmachim.top/
-// @version      1.0.1
+// @version      1.0.0
 // @description  חיפוש סמנטי מוטמע במתמחים טופ, עם Gemini מקומי בדפדפן
-// @author       Mitmachim AI Search
+// @author       מייבין במקצת
 // @match        https://mitmachim.top/*
 // @match        https://www.mitmachim.top/*
 // @icon         https://hebbkx1anhila5yf.public.blob.vercel-storage.com/gpt-image-2_%D7%94%D7%A2%D7%9C%D7%99%D7%AA%D7%99_%D7%9C%D7%9A_%D7%AA%D7%9E%D7%95%D7%A0%D7%94%D7%99%D7%A9_%D7%91%D7%94_%D7%A1%D7%99%D7%9E%D7%95%D7%9F_%D7%A9%D7%9C_%D7%94%D7%90%D7%99%D7%99%D7%A7%D7%95%D7%9F_%D7%A9%D7%9C_%D7%90%D7%AA%D7%A8-0-xJNfbiCLQi0BHTD9KclXqR5F06BgBg.jpg
@@ -80,8 +80,17 @@
             headers: { 'Content-Type': 'application/json' },
             data: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.25 } })
           });
-          if ([403, 429].includes(response.status) || response.status >= 500) throw new Error(`Gemini ${response.status}`);
-          if (response.status >= 400) throw new Error('מפתח Gemini אינו תקין');
+          if (response.status >= 400) {
+            let errMsg = `שגיאת Gemini ${response.status}`;
+            try {
+              const errBody = JSON.parse(response.responseText);
+              const detail = errBody?.error?.message;
+              if (detail) errMsg += `: ${detail}`;
+            } catch (_) {}
+            if ([429].includes(response.status)) errMsg = `חריגה ממכסת הבקשות (429) — נסה מפתח אחר`;
+            if ([403].includes(response.status)) errMsg = `הגישה נדחתה (403) — בדוק שה-API מופעל ב-Google Cloud`;
+            throw new Error(errMsg);
+          }
           this.index = (index + 1) % this.keys.length; GM_setValue('mitmachim-ai-key-index', this.index);
           const payload = JSON.parse(response.responseText);
           return cleanJson(payload.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('') || '');
@@ -92,7 +101,25 @@
   }
 
   async function planSearch(query, keyManager, signal) {
-    return keyManager.call(`אתה מתכנן חיפוש בפורום הטכנולוגיה החרדי mitmachim.top. עבור השאלה: "${query}" החזר JSON בלבד: {"queries":[3 עד 8 שאילתות עברית קצרות ומגוונות, ללא site:],"possibleTitles":[עד 5 כותרות אפשריות],"synonyms":[עד 8 מילים]}. אל תענה על השאלה.`, signal);
+    return keyManager.call(`אתה מתכנן חיפוש בפורום הטכנולוגיה החרדי mitmachim.top.
+עבור השאלה: "${query}"
+החזר JSON בלבד בפורמט הבא, ללא טקסט נוסף:
+{"queries":["2-4 מילות מפתח קצרות בעברית שצפויות להופיע בכותרות פוסטים קשורים לשאלה — בלי site:, בלי משפטים שלמים"],"possibleTitles":["עד 3 כותרות ספציפיות שעשויות להיות בפורום"],"synonyms":["עד 5 מילים נרדפות לנושא הראשי בלבד"]}
+חשוב: הקפד שכל השאילתות קשורות ישירות לנושא הספציפי של השאלה. אל תוסיף נושאים כלליים לא-קשורים. אל תענה על השאלה עצמה.`, signal);
+  }
+
+  async function filterRelevantResults(query, results, keyManager, signal) {
+    if (!results.length) return results;
+    const compact = results.slice(0, 40).map((r, i) => ({ i, title: r.title, snippet: (r.snippet || '').slice(0, 120) })).map(JSON.stringify).join('\n');
+    try {
+      const data = await keyManager.call(`השאלה: "${query}".
+להלן רשימת תוצאות חיפוש מהפורום. סנן רק את התוצאות שקשורות ישירות לשאלה. התעלם מתוצאות שמזכירות את מילות החיפוש בצורה אגבית בלבד.
+החזר JSON בלבד: {"relevant":[מספרי האינדקסים של התוצאות הרלוונטיות בלבד, לדוגמה: 0,2,5]}
+${compact}`, signal);
+      const relevant = new Set((data.relevant || []).map(Number));
+      if (!relevant.size) return results; // במקרה של כשלון — לא לסנן
+      return results.filter((_, i) => i >= 40 || relevant.has(i));
+    } catch (_) { return results; }
   }
 
   async function explainResults(query, results, keyManager, signal) {
@@ -417,7 +444,7 @@ ${recentQueries.length ? `
     body.querySelector('#mai-add-key').addEventListener('click', () => {
       const input = body.querySelector('#mai-new-key');
       const key = input.value.trim();
-      if (!/^AIza[\w-]{20,}$/.test(key)) return alert('מבנה המפתח אינו תקין');
+      if (key.length < 8) return alert('המפתח קצר מדי — נסה שוב');
       storage.update({ keys: [...settings.keys, key] });
       renderSettings();
     });
@@ -450,6 +477,8 @@ ${recentQueries.length ? `
         page++;
       }
       state.results = [...merged.values()].sort((a, b) => b.score - a.score);
+      status.textContent = 'Gemini מסנן תוצאות רלוונטיות…';
+      state.results = await filterRelevantResults(query, state.results, manager, state.controller.signal);
       if (settings.explain) { status.textContent = 'Gemini מוסיף הסברים לתוצאות…'; state.results = await explainResults(query, state.results, manager, state.controller.signal); }
       const fresh = storage.get(); const historyList = [query, ...fresh.history.filter((item) => item !== query)].slice(0, 10); const cache = { ...fresh.cache, [cacheKey]: { at: Date.now(), results: state.results, plans: queries } };
       Object.keys(cache).forEach((key) => { if (Date.now() - cache[key].at > CACHE_TTL) delete cache[key]; }); storage.update({ history: historyList, cache, explain: body.querySelector('#mai-explain').checked });
