@@ -239,9 +239,23 @@ ${compact}`, signal);
     try {
       const scoped = `site:${TARGET_HOST} ${query}`;
       const offset = Math.max(0, (page - 1) * 30);
-      const res = await request({ method: 'POST', url: 'https://html.duckduckgo.com/html/',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'text/html', 'Accept-Language': 'he-IL,he;q=0.9' },
-        data: `q=${encodeURIComponent(scoped)}&s=${offset}&dc=${offset + 1}`, signal });
+      const DDG_HEADERS = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.7,en;q=0.5',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Origin': 'https://html.duckduckgo.com',
+        'Referer': 'https://html.duckduckgo.com/',
+      };
+      let res;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) await new Promise(r => setTimeout(r, 1500 * attempt));
+        res = await request({ method: 'POST', url: 'https://html.duckduckgo.com/html/',
+          headers: DDG_HEADERS,
+          data: `q=${encodeURIComponent(scoped)}&s=${offset}&dc=${offset + 1}`, signal });
+        if (res.status === 418 || res.status === 429) { console.warn(`[mitmachim-ai-search] DDG blocked (${res.status}), retry ${attempt + 1}`); continue; }
+        break;
+      }
       if (res.status !== 200) return [];
       const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
       const found = [];
