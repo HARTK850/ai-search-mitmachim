@@ -24,7 +24,23 @@
   const STORE_VERSION = 1;
   const CACHE_TTL = 30 * 60 * 1000;
   const PAGE_SIZE = 12;
-  const state = { controller: null, results: [], page: 1, query: '', plans: [], busy: false, lastFocus: null };
+  const state = { controller: null, results: [], page: 1, query: '', plans: [], busy: false, lastFocus: null, originalContent: null };
+  const AI_SEARCH_PATH = '/search';
+  const AI_SEARCH_PARAM = 'ai';
+
+  function isAiSearchUrl(url = location.href) {
+    const u = new URL(url, location.origin);
+    return u.pathname === AI_SEARCH_PATH && u.searchParams.has(AI_SEARCH_PARAM);
+  }
+
+  function buildAiSearchUrl(query) {
+    const u = new URL(AI_SEARCH_PATH, location.origin);
+    u.searchParams.set(AI_SEARCH_PARAM, '');
+    if (query) u.searchParams.set('q', query);
+    return u.pathname + u.search;
+  }
+
+  function getContentEl() { return document.getElementById('content'); }
 
   const storage = {
     get() {
@@ -106,121 +122,107 @@ ${compact}`, signal);
   function styles() {
     const style = document.createElement('style'); 
     style.id = 'mai-styles'; 
-    style.textContent = `.mai-icon{width:20px;height:20px;object-fit:cover;border-radius:4px;display:block;all:unset}
-.mai-overlay{position:fixed;inset:0;z-index:10050;background:rgba(27,36,48,.48);display:flex;align-items:flex-start;justify-content:center;padding:4vh 16px;direction:rtl;all:unset}
-.mai-dialog{background:#fff;color:#263238;width:min(940px,100%);max-height:92vh;border-radius:12px;box-shadow:0 24px 70px rgba(20,35,50,.25);display:flex;flex-direction:column;overflow:hidden;font-family:Arial,sans-serif;all:unset}
-.mai-head{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid #dfe5ea;all:unset}
-.mai-head img{width:38px;height:38px;border-radius:8px;all:unset}
-.mai-title{flex:1;all:unset}
-.mai-title h2{font-size:20px;margin:0;color:#2d75b9;all:unset}
-.mai-title p{font-size:14px;margin:2px 0 0;color:#6c7883;all:unset}
-.mai-icon-btn{border:0;background:transparent;color:#64717c;font-size:24px;padding:5px 10px;cursor:pointer;all:unset}
-.mai-body{padding:18px;overflow:auto;all:unset}
-.mai-search-row{display:flex;gap:8px;all:unset}
-.mai-input{flex:1;min-width:0;border:1px solid #cad4dd;border-radius:7px;padding:11px 13px;font-size:16px;background:#fff;color:#263238;all:unset}
-.mai-btn{border:1px solid #1976ed;background:#1976ed;color:#fff;border-radius:7px;padding:9px 16px;font-size:15px;cursor:pointer;all:unset}
-.mai-btn.secondary{background:#fff;color:#53616d;border-color:#cad4dd;all:unset}
-.mai-btn.danger{background:#fff;color:#b4233c;border-color:#e7b8c1;all:unset}
-.mai-tools{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:12px;all:unset}
-.mai-muted{color:#71808d;font-size:14px;all:unset}
-.mai-results{display:flex;flex-direction:column;margin-top:12px;all:unset}
-.mai-card{display:flex;gap:14px;padding:17px 4px;border-top:1px solid #e2e7eb;all:unset}
-.mai-avatar{flex:0 0 42px;width:42px;height:42px;border-radius:50%;background:#2d75b9;color:#fff;display:flex;align-items:center;justify-content:center;font-size:20px;all:unset}
-.mai-content{min-width:0;flex:1;all:unset}
-.mai-card h3{font-size:20px;margin:0 0 6px;all:unset}
-.mai-card h3 a{color:#1473e6;text-decoration:none;all:unset}
-.mai-snippet{font-size:15px;line-height:1.55;margin:0;color:#35434f;all:unset}
-.mai-explain{font-size:14px;margin-top:8px;padding:8px;background:#f5f8fc;border-radius:4px;color:#36434f;all:unset}
-.mai-meta{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;all:unset}
-.mai-badge{display:inline-block;background:#e3f2fd;color:#1976ed;font-size:12px;padding:3px 8px;border-radius:3px;all:unset}
-.mai-label{display:block;margin:12px 0;all:unset}
-.mai-label input{margin-top:4px;all:unset}
-.mai-key-row{display:flex;gap:8px;align-items:center;padding:8px 0;border-top:1px solid #dfe5ea;all:unset}
-.mai-key-row code{background:#f5f8fc;padding:4px 8px;border-radius:4px;font-size:12px;all:unset}
-.mai-empty{text-align:center;padding:40px 20px;color:#71808d;all:unset}
-.mai-history{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px;all:unset}
-.mai-history button{padding:6px 12px;border:1px solid #cad4dd;border-radius:6px;background:#fff;cursor:pointer;font-size:14px;all:unset}
-.mai-pager{display:flex;gap:6px;justify-content:center;margin-top:24px;padding-top:16px;border-top:1px solid #dfe5ea;all:unset}
-.mai-pager .mai-btn{padding:6px 12px;font-size:14px;all:unset}
-.mai-settings{all:unset}
-.mai-settings h3{font-size:18px;margin:0 0 16px;color:#2d75b9;all:unset}`;
+    style.textContent = `.mai-icon{width:20px;height:20px;object-fit:cover;border-radius:50%;display:block}
+.mai-icon-heading{width:24px;height:24px}
+.mai-explain{font-size:14px;margin-top:8px;padding:8px;background:#f5f8fc;border-radius:4px;color:#36434f}
+.mai-empty{text-align:center;padding:40px 20px;color:#71808d}
+.mai-skeleton{height:70px;border-radius:6px;margin-bottom:10px;background:linear-gradient(90deg,#eef1f4 25%,#e4e8ec 37%,#eef1f4 63%);background-size:400% 100%;animation:mai-shimmer 1.4s ease infinite}
+@keyframes mai-shimmer{0%{background-position:100% 0}100%{background-position:0 0}}`;
     document.head.appendChild(style);
   }
 
   function shell() {
-    if (document.getElementById('mai-overlay')) return;
-    state.lastFocus = document.activeElement;
-    const overlay = document.createElement('div'); 
-    overlay.id = 'mai-overlay'; 
-    overlay.className = 'mai-overlay'; 
-    overlay.innerHTML = `<section class="mai-dialog" role="dialog" aria-modal="true" aria-labelledby="mai-heading">
-<header class="mai-head">
-<img src="${ICON_URL}" alt="">
-<div class="mai-title">
-<h2 id="mai-heading">חיפוש AI במתמחים טופ</h2>
-<p>חיפוש חכם בכל נושאי הפורום</p>
+    const contentEl = getContentEl();
+    if (!contentEl || contentEl.dataset.maiActive) return;
+    if (state.originalContent === null) state.originalContent = contentEl.innerHTML;
+    contentEl.dataset.maiActive = 'true';
+    const urlQuery = new URL(location.href).searchParams.get('q');
+    if (urlQuery) state.query = urlQuery;
+    contentEl.innerHTML = `<div class="search flex-fill" id="mai-root">
+<div class="d-flex flex-column flex-md-row">
+<div class="flex-shrink-0 pe-2 border-end-md text-sm mb-3" style="flex-basis: 240px!important;">
+<div class="nav sticky-md-top d-flex flex-row flex-md-column flex-wrap gap-3 pe-md-3" style="top: 1rem; z-index: 1;">
+<h2 class="fw-semibold tracking-tight mb-0 d-flex align-items-center gap-2"><img class="mai-icon mai-icon-heading" src="${ICON_URL}" alt="">חיפוש AI</h2>
+<p class="text-sm text-muted mb-0">חיפוש חכם בכל נושאי הפורום, מבוסס Gemini</p>
+<button type="button" class="btn btn-light btn-sm border w-100" id="mai-settings-btn">הגדרות מפתחות Gemini</button>
+<a href="https://mitmachim.top/search" class="btn btn-ghost btn-sm border w-100" id="mai-native-link">חיפוש רגיל בפורום</a>
 </div>
-<button class="mai-icon-btn" id="mai-settings" title="הגדרות" aria-label="הגדרות">⚙</button>
-<button class="mai-icon-btn" id="mai-close" title="סגירה" aria-label="סגירה">×</button>
-</header>
-<main class="mai-body" id="mai-body"></main>
-</section>`;
-    document.body.appendChild(overlay); 
+</div>
+<div class="flex-grow-1 ps-md-2 ps-lg-5" style="min-width:0;">
+<div id="mai-body"></div>
+</div>
+</div>
+</div>`;
     renderSearch();
-    overlay.querySelector('#mai-close').addEventListener('click', close);
-    overlay.querySelector('#mai-settings').addEventListener('click', renderSettings);
-    overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
-    document.addEventListener('keydown', keyboard);
+    contentEl.querySelector('#mai-settings-btn').addEventListener('click', renderSettings);
+    contentEl.querySelector('#mai-native-link').addEventListener('click', (event) => { event.preventDefault(); close(); });
+    if (urlQuery) run(urlQuery);
   }
 
-  function close() { state.controller?.abort(); document.getElementById('mai-overlay')?.remove(); document.removeEventListener('keydown', keyboard); state.lastFocus?.focus?.(); }
+  function close(skipHistory) {
+    state.controller?.abort();
+    const contentEl = getContentEl();
+    if (contentEl && contentEl.dataset.maiActive) {
+      if (state.originalContent !== null) contentEl.innerHTML = state.originalContent;
+      delete contentEl.dataset.maiActive;
+    }
+    if (!skipHistory && isAiSearchUrl()) {
+      if (state.cameFromHistory) history.back();
+      else history.pushState({}, '', location.pathname === AI_SEARCH_PATH ? '/' : location.pathname);
+    }
+  }
+
+  function navigateToAiSearch(query) {
+    state.cameFromHistory = false;
+    history.pushState({ maiSearch: true }, '', buildAiSearchUrl(query));
+    shell();
+  }
+
+  window.addEventListener('popstate', () => {
+    if (isAiSearchUrl()) { state.cameFromHistory = true; shell(); }
+    else close(true);
+  });
   
-  function keyboard(event) { 
-    if (event.key === 'Escape') close(); 
-    if (event.key === 'Tab') { 
-      const box = document.querySelector('.mai-dialog'); 
-      const focusable = [...box.querySelectorAll('button,input,a[href]')].filter((el) => !el.disabled); 
-      if (!focusable.length) return; 
-      const first = focusable[0], last = focusable.at(-1); 
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } 
-      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } 
-    } 
+  function keyboard(event) {
+    if (event.key === 'Escape') close();
   }
 
   function renderSearch() {
     const body = document.getElementById('mai-body'); if (!body) return;
-    const settings = storage.get(); const history = settings.history.slice(0, 7);
-    body.innerHTML = `<form id="mai-form">
-<div class="mai-search-row">
-<input id="mai-query" class="mai-input" aria-label="מה תרצו למצוא" placeholder="לדוגמה: תוכנה לחסימת פרסומות באנדרואיד" value="${escapeHtml(state.query)}">
-<button class="mai-btn" type="submit">חיפוש</button>
-<button class="mai-btn secondary" type="button" id="mai-cancel" hidden>ביטול</button>
+    const settings = storage.get(); const recentQueries = settings.history.slice(0, 7);
+    body.innerHTML = `<form id="mai-form" class="d-flex flex-column gap-3">
+<div class="d-flex flex-wrap gap-2">
+<input id="mai-query" class="form-control fw-semibold py-2 ps-2 pe-3" style="min-width:0;flex:1 1 260px;" aria-label="מה תרצו למצוא" placeholder="לדוגמה: תוכנה לחסימת פרסומות באנדרואיד" value="${escapeHtml(state.query)}">
+<button class="btn btn-primary fw-semibold px-3" type="submit">חיפוש</button>
+<button class="btn btn-light border" type="button" id="mai-cancel" hidden>ביטול</button>
 </div>
-<div class="mai-tools">
-<label><input id="mai-explain" type="checkbox" ${settings.explain ? 'checked' : ''}> הוסף הסבר AI קצר לכל תוצאה</label>
-<span class="mai-muted" id="mai-status">Gemini משמש רק בדפדפן; המפתחות לא נשלחים לשרת</span>
+<div class="d-flex flex-wrap gap-2 align-items-center justify-content-between text-sm">
+<label class="d-flex align-items-center gap-2"><input id="mai-explain" type="checkbox" ${settings.explain ? 'checked' : ''}> הוסף הסבר AI קצר לכל תוצאה</label>
+<span class="text-muted" id="mai-status">Gemini משמש רק בדפדפן; המפתחות לא נשלחים לשרת</span>
 </div>
-<div class="mai-history">${history.map((q) => `<button type="button" data-query="${escapeHtml(q)}">${escapeHtml(q)}</button>`).join('')}</div>
+${recentQueries.length ? `<div class="d-flex flex-wrap gap-2">${recentQueries.map((q) => `<button type="button" class="btn btn-light btn-sm border" data-query="${escapeHtml(q)}">${escapeHtml(q)}</button>`).join('')}</div>` : ''}
 </form>
-<div id="mai-results" class="mai-results"></div>`;
-    body.querySelector('#mai-form').addEventListener('submit', (event) => { event.preventDefault(); run(body.querySelector('#mai-query').value); });
+<div id="mai-results" class="mt-3"></div>`;
+    body.querySelector('#mai-form').addEventListener('submit', (event) => { event.preventDefault(); const q = body.querySelector('#mai-query').value; if (isAiSearchUrl()) history.replaceState({ maiSearch: true }, '', buildAiSearchUrl(q)); run(q); });
     body.querySelector('#mai-cancel').addEventListener('click', () => state.controller?.abort());
     body.querySelector('#mai-explain').addEventListener('change', (e) => { storage.update({ explain: e.target.checked }); });
-    body.querySelectorAll('[data-query]').forEach((button) => button.addEventListener('click', () => { body.querySelector('#mai-query').value = button.dataset.query; run(button.dataset.query); }));
+    body.querySelectorAll('[data-query]').forEach((button) => button.addEventListener('click', () => { body.querySelector('#mai-query').value = button.dataset.query; if (isAiSearchUrl()) history.replaceState({ maiSearch: true }, '', buildAiSearchUrl(button.dataset.query)); run(button.dataset.query); }));
     body.querySelector('#mai-query').focus(); if (state.results.length) renderResults();
   }
 
   function renderSettings() {
     const body = document.getElementById('mai-body'); const settings = storage.get();
-    body.innerHTML = `<div class="mai-settings">
-<h3>הגדרות חיפוש</h3>
-<label class="mai-label">הוספת מפתח Gemini<input class="mai-input" id="mai-new-key" type="password" dir="ltr" autocomplete="off" placeholder="AIza..."></label>
-<button class="mai-btn" id="mai-add-key">הוספת מפתח</button>
-<div id="mai-keys">${settings.keys.map((key, index) => `<div class="mai-key-row"><code>${escapeHtml(maskKey(key))}</code><button class="mai-btn danger" data-remove="${index}">מחיקה</button></div>`).join('') || '<p class="mai-muted">עדיין לא נשמרו מפתחות.</p>'}</div>
-<div class="mai-tools">
-<button class="mai-btn secondary" id="mai-back">חזרה</button>
+    body.innerHTML = `<div class="d-flex flex-column gap-3">
+<h3 class="fw-semibold tracking-tight mb-0">הגדרות חיפוש AI</h3>
+<label class="d-flex flex-column gap-1 text-sm">הוספת מפתח Gemini
+<input class="form-control py-2 ps-2 pe-3" id="mai-new-key" type="password" dir="ltr" autocomplete="off" placeholder="AIza...">
+</label>
+<button class="btn btn-primary fw-semibold align-self-start px-3" id="mai-add-key">הוספת מפתח</button>
+<div id="mai-keys" class="d-flex flex-column gap-2">${settings.keys.map((key, index) => `<div class="d-flex align-items-center gap-2 border-top pt-2"><code class="text-sm">${escapeHtml(maskKey(key))}</code><button class="btn btn-light btn-sm border text-danger" data-remove="${index}">מחיקה</button></div>`).join('') || '<p class="text-muted text-sm mb-0">עדיין לא נשמרו מפתחות.</p>'}</div>
+<div>
+<button class="btn btn-light border" id="mai-back">חזרה</button>
 </div>
-<p class="mai-muted">המפתחות נשמרים ב-Tampermonkey בלבד ונשלחים ישירות ל-Gemini.<br>כתובת שרת: <code dir="ltr">${escapeHtml(DEFAULT_SERVER_URL)}</code></p>
+<p class="text-muted text-sm mb-0">המפתחות נשמרים ב-Tampermonkey בלבד ונשלחים ישירות ל-Gemini.<br>כתובת שרת: <code dir="ltr">${escapeHtml(DEFAULT_SERVER_URL)}</code></p>
 </div>`;
     body.querySelector('#mai-add-key').addEventListener('click', () => { 
       const input = body.querySelector('#mai-new-key'); 
@@ -258,12 +260,12 @@ ${compact}`, signal);
       }
       state.results = [...merged.values()].sort((a, b) => b.score - a.score);
       if (settings.explain) { status.textContent = 'Gemini מוסיף הסברים לתוצאות…'; state.results = await explainResults(query, state.results, manager, state.controller.signal); }
-      const fresh = storage.get(); const history = [query, ...fresh.history.filter((item) => item !== query)].slice(0, 10); const cache = { ...fresh.cache, [cacheKey]: { at: Date.now(), results: state.results, plans: queries } };
-      Object.keys(cache).forEach((key) => { if (Date.now() - cache[key].at > CACHE_TTL) delete cache[key]; }); storage.update({ history, cache, explain: body.querySelector('#mai-explain').checked });
+      const fresh = storage.get(); const historyList = [query, ...fresh.history.filter((item) => item !== query)].slice(0, 10); const cache = { ...fresh.cache, [cacheKey]: { at: Date.now(), results: state.results, plans: queries } };
+      Object.keys(cache).forEach((key) => { if (Date.now() - cache[key].at > CACHE_TTL) delete cache[key]; }); storage.update({ history: historyList, cache, explain: body.querySelector('#mai-explain').checked });
       renderResults(); status.textContent = `נמצאו ${state.results.length} תוצאות ייחודיות`;
     } catch (error) {
       if (error.name === 'AbortError') { results.innerHTML = '<div class="mai-empty">החיפוש בוטל.</div>'; status.textContent = 'החיפוש בוטל'; }
-      else { results.innerHTML = `<div class="mai-empty"><strong>${escapeHtml(error.message)}</strong><br><button class="mai-btn" id="mai-retry">ניסיון חוזר</button></div>`; results.querySelector('#mai-retry').addEventListener('click', () => run(query)); status.textContent = 'אירעה שגיאה'; }
+      else { results.innerHTML = `<div class="mai-empty"><strong>${escapeHtml(error.message)}</strong><br><button class="btn btn-primary btn-sm mt-2" id="mai-retry">ניסיון חוזר</button></div>`; results.querySelector('#mai-retry').addEventListener('click', () => run(query)); status.textContent = 'אירעה שגיאה'; }
     } finally { state.busy = false; cancel.hidden = true; }
   }
 
@@ -271,27 +273,54 @@ ${compact}`, signal);
     const container = document.getElementById('mai-results'); if (!container) return;
     if (!state.results.length) { container.innerHTML = '<div class="mai-empty"><strong>לא נמצאו תוצאות</strong><p>נסו לנסח את הבקשה אחרת או להרחיב את מילות החיפוש.</p></div>'; return; }
     const totalPages = Math.ceil(state.results.length / PAGE_SIZE); state.page = Math.min(state.page, totalPages); const start = (state.page - 1) * PAGE_SIZE;
-    const cards = state.results.slice(start, start + PAGE_SIZE).map((item) => `<article class="mai-card"><div class="mai-avatar" aria-hidden="true">${escapeHtml(item.title.trim().charAt(0) || 'מ')}</div><div class="mai-content"><h3><a href="${escapeHtml(item.url)}" target="_blank">${escapeHtml(item.title)}</a></h3><p class="mai-snippet">${escapeHtml(item.snippet || 'לחצו לפתיחת הנושא במתמחים טופ')}</p>${item.explanation ? `<div class="mai-explain"><strong>הסבר AI:</strong> ${escapeHtml(item.explanation)}</div>` : ''}<div class="mai-meta"><span class="mai-badge">ציון ${Math.round(item.score)}</span>${(item.sources || []).map((source) => `<span class="mai-badge">${escapeHtml(source)}</span>`).join('')}</div></div></article>`).join('');
-    container.innerHTML = `${cards}<nav class="mai-pager" aria-label="עמודי תוצאות">${Array.from({ length: totalPages }, (_, i) => `<button class="mai-btn ${i + 1 === state.page ? '' : 'secondary'} mai-page" data-page="${i + 1}">${i + 1}</button>`).join('')}</nav>`;
-    container.querySelectorAll('[data-page]').forEach((button) => button.addEventListener('click', () => { state.page = Number(button.dataset.page); renderResults(); document.querySelector('.mai-body').scrollTo({ top: 0, behavior: 'smooth' }); }));
+    const cards = state.results.slice(start, start + PAGE_SIZE).map((item) => `<li class="posts-list-item">
+<hr>
+<a class="topic-title fw-semibold fs-5 mb-2 text-reset text-break d-block" href="${escapeHtml(item.url)}" target="_blank" rel="noopener">
+<i class="fa fa-book text-muted" title="נושא"></i> ${escapeHtml(item.title)}
+</a>
+<div class="post-body d-flex flex-column gap-1 mb-2">
+<div class="d-flex gap-2 post-info text-sm align-items-center">
+<span class="avatar not-responsive avatar-rounded d-inline-flex align-items-center justify-content-center" style="--avatar-size:16px;width:16px;height:16px;border-radius:50%;background-color:#1976ed;color:#fff;font-size:10px;">${escapeHtml((item.title || 'מ').trim().charAt(0))}</span>
+<span class="text-muted lh-1">ציון התאמה ${Math.round(item.score)}</span>
+</div>
+<div component="post/content" class="content text-sm text-break">
+<p dir="auto">${escapeHtml(item.snippet || 'לחצו לפתיחת הנושא במתמחים טופ')}</p>
+${item.explanation ? `<p dir="auto" class="mai-explain"><strong>הסבר AI:</strong> ${escapeHtml(item.explanation)}</p>` : ''}
+</div>
+</div>
+${(item.sources || []).length ? `<div class="mb-3 d-flex flex-wrap gap-1 w-100">${(item.sources || []).map((source) => `<span class="badge px-1 text-truncate border text-sm">${escapeHtml(source)}</span>`).join('')}</div>` : ''}
+</li>`).join('');
+    container.innerHTML = `<ul component="posts" class="posts-list list-unstyled">${cards}</ul><nav class="mai-pager d-flex gap-2 justify-content-center mt-3 pt-3 border-top" aria-label="עמודי תוצאות">${Array.from({ length: totalPages }, (_, i) => `<button class="btn btn-sm ${i + 1 === state.page ? 'btn-primary' : 'btn-light border'} mai-page" data-page="${i + 1}">${i + 1}</button>`).join('')}</nav>`;
+    container.querySelectorAll('[data-page]').forEach((button) => button.addEventListener('click', () => { state.page = Number(button.dataset.page); renderResults(); getContentEl()?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }));
   }
 
   function enhanceSearchLink() {
-    const link = document.querySelector('a.advanced-search-link'); if (!link || link.dataset.maiReady) return;
-    link.dataset.maiReady = 'true'; const oldIcon = link.querySelector('i.fa.fa-gears, i.fa-gears');
-    if (oldIcon) { const image = document.createElement('img'); image.className = 'mai-icon'; image.src = ICON_URL; image.alt = ''; oldIcon.replaceWith(image); }
-    link.setAttribute('title', 'חיפוש AI מתקדם'); link.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); shell(); });
+    document.querySelectorAll('a.advanced-search-link').forEach((link) => {
+      if (link.dataset.maiReady) return;
+      link.dataset.maiReady = 'true';
+      const oldIcon = link.querySelector('i.fa.fa-gears, i.fa-gears');
+      if (oldIcon) { const image = document.createElement('img'); image.className = 'mai-icon'; image.src = ICON_URL; image.alt = ''; oldIcon.replaceWith(image); }
+      link.setAttribute('title', 'חיפוש AI מתקדם'); link.setAttribute('href', buildAiSearchUrl());
+      link.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); navigateToAiSearch(); });
+    });
   }
 
-  if (!document.getElementById('mai-styles')) styles(); 
+  if (!document.getElementById('mai-styles')) styles();
   enhanceSearchLink();
-  let scheduled = false; 
-  new MutationObserver(() => { 
-    if (scheduled) return; 
-    scheduled = true; 
-    requestAnimationFrame(() => { 
-      scheduled = false; 
-      enhanceSearchLink(); 
-    }); 
+  if (isAiSearchUrl()) { state.cameFromHistory = true; shell(); }
+  let scheduled = false;
+  new MutationObserver((mutations) => {
+    // Only act when nodes were actually added (ignore attribute/text mutations)
+    if (!mutations.some((m) => m.addedNodes.length)) return;
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      // Reset maiReady on links no longer in DOM so they get re-enhanced if re-inserted
+      document.querySelectorAll('a.advanced-search-link').forEach((link) => {
+        if (!document.contains(link)) delete link.dataset.maiReady;
+      });
+      enhanceSearchLink();
+    });
   }).observe(document.body, { childList: true, subtree: true });
 })();
