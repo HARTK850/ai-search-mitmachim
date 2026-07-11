@@ -113,9 +113,16 @@ ${compact}`, signal);
       headers: { 'Content-Type': 'application/json' },
       data: JSON.stringify({ queries, page, pages_per_query: 1, limit: 70 })
     });
-    if (response.status >= 400) throw new Error('שרת החיפוש אינו זמין');
-    const payload = JSON.parse(response.responseText);
-    if (!payload.success) throw new Error(payload.error?.message || 'החיפוש נכשל');
+    let payload;
+    try {
+      payload = JSON.parse(response.responseText);
+    } catch (_) {
+      throw new Error(`שרת החיפוש אינו זמין (סטטוס ${response.status})`);
+    }
+    if (!payload || payload.success !== true) {
+      const serverMessage = payload?.error?.message;
+      throw new Error(serverMessage || `החיפוש נכשל (סטטוס ${response.status})`);
+    }
     return payload;
   }
 
