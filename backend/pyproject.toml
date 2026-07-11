@@ -1,0 +1,13 @@
+[project]
+name = "mitmachim-ai-search"
+version = "1.0.0"
+requires-python = ">=3.12"
+dependencies = [
+  "beautifulsoup4>=4.12.3,<5",
+  "fastapi>=0.115.0,<1",
+  "requests>=2.32.3,<3",
+  "uvicorn[standard]>=0.30.0,<1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3.0,<9"]
