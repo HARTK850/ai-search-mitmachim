@@ -1,7 +1,0 @@
-main.py
-pyproject.toml
-mitmachim_ai_search.egg-info/PKG-INFO
-mitmachim_ai_search.egg-info/SOURCES.txt
-mitmachim_ai_search.egg-info/dependency_links.txt
-mitmachim_ai_search.egg-info/requires.txt
-mitmachim_ai_search.egg-info/top_level.txt
