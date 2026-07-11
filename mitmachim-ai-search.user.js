@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         חיפוש AI למתמחים טופ
 // @namespace    https://mitmachim.top/
-// @version      1.0.0
+// @version      1.0.1
 // @description  חיפוש סמנטי מוטמע במתמחים טופ, עם Gemini מקומי בדפדפן
-// @author       מייבין במקצת
+// @author       Mitmachim AI Search
 // @match        https://mitmachim.top/*
 // @match        https://www.mitmachim.top/*
 // @icon         https://hebbkx1anhila5yf.public.blob.vercel-storage.com/gpt-image-2_%D7%94%D7%A2%D7%9C%D7%99%D7%AA%D7%99_%D7%9C%D7%9A_%D7%AA%D7%9E%D7%95%D7%A0%D7%94%D7%99%D7%A9_%D7%91%D7%94_%D7%A1%D7%99%D7%9E%D7%95%D7%9F_%D7%A9%D7%9C_%D7%94%D7%90%D7%99%D7%99%D7%A7%D7%95%D7%9F_%D7%A9%D7%9C_%D7%90%D7%AA%D7%A8-0-xJNfbiCLQi0BHTD9KclXqR5F06BgBg.jpg
@@ -285,13 +285,29 @@ ${compact}`, signal);
   }
 
   // Main: runs both sources in parallel per query, merges and scores locally.
+  // בודק פעם אחת אם DDG נגיש (נטפרי/NetFree חוסם אותו עם 418)
+  let ddgAvailable = null;
+  async function isDdgAvailable(signal) {
+    if (ddgAvailable !== null) return ddgAvailable;
+    try {
+      const res = await request({ method: 'POST', url: 'https://html.duckduckgo.com/html/',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36' },
+        data: 'q=test', signal });
+      ddgAvailable = res.status === 200;
+    } catch { ddgAvailable = false; }
+    console.log('[mitmachim-ai-search] DDG available: ' + ddgAvailable);
+    return ddgAvailable;
+  }
+
   async function localSearch(queries, page, signal) {
+    const ddgOk = await isDdgAvailable(signal);
     const groups = await Promise.all(queries.map(async (q) => {
-      const [forum, ddg] = await Promise.all([forumSearch(q, page), duckduckgoSearch(q, page, signal)]);
+      const forum = await forumSearch(q, page);
+      const ddg = ddgOk ? await duckduckgoSearch(q, page, signal) : [];
       return [q, [...forum, ...ddg]];
     }));
     const results = mergeResults(groups, queries);
-    return { results, meta: { queries, count: results.length, page, hasMore: false, nextPage: null } };
+    return { results, meta: { queries, count: results.length, page, hasMore: false, nextPage: null, ddgBlocked: !ddgOk } };
   }
 
 
