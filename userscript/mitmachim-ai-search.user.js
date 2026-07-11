@@ -107,20 +107,79 @@ ${compact}`, signal);
     } catch (_) { return results; }
   }
 
+  // Scrapes mitmachim.top's own /search page directly from the browser.
+  // Because this runs same-origin (the userscript is @match'd to
+  // mitmachim.top itself), it goes out with the user's real session/cookies
+  // and a real browser TLS fingerprint — unlike a server-side request from
+  // Vercel, this is not distinguishable from a normal logged-in visit and
+  // won't get caught by bot-detection/firewalls in front of the forum.
+  async function clientSiteSearch(query, page) {
+    try {
+      const url = `/search?term=${encodeURIComponent(query)}&page=${page}`;
+      const res = await fetch(url, { credentials: 'same-origin' });
+      if (!res.ok) return [];
+      const html = await res.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const links = doc.querySelectorAll("a[href*='/topic/']");
+      const seen = new Set();
+      const found = [];
+      for (const link of links) {
+        const href = link.getAttribute('href') || '';
+        const match = href.match(/\/topic\/(\d+)/);
+        if (!match) continue;
+        const key = match[1];
+        const title = (link.textContent || '').trim();
+        if (!title || seen.has(key)) continue;
+        seen.add(key);
+        const parent = link.closest('li, article, div');
+        const snippet = parent ? (parent.textContent || '').trim().slice(0, 360) : '';
+        found.push({ title, url: new URL(href, location.origin).href, snippet });
+        if (found.length >= 40) break;
+      }
+      return found;
+    } catch (err) {
+      console.warn('[mitmachim-ai-search] client-side forum search failed', err);
+      return [];
+    }
+  }
+
   async function serverSearch(queries, page, signal) {
     const base = DEFAULT_SERVER_URL;
+    // Gather forum results ourselves, in-browser, for every query in parallel.
+    const clientTopicLists = await Promise.all(queries.map((q) => clientSiteSearch(q, page)));
+    const seen = new Set();
+    const client_topics = [];
+    for (const list of clientTopicLists) {
+      for (const topic of list) {
+        const key = topic.url;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        client_topics.push(topic);
+        if (client_topics.length >= 200) break;
+      }
+      if (client_topics.length >= 200) break;
+    }
+
     const response = await request({ method: 'POST', url: `${base}/api/search`, signal,
       headers: { 'Content-Type': 'application/json' },
-      data: JSON.stringify({ queries, page, pages_per_query: 1, limit: 70 })
+      data: JSON.stringify({ queries, page, pages_per_query: 1, limit: 70, client_topics })
     });
     let payload;
     try {
       payload = JSON.parse(response.responseText);
     } catch (_) {
-      throw new Error(`שרת החיפוש אינו זמין (סטטוס ${response.status})`);
+      // Not JSON — likely an intermediary (Vercel Firewall/WAF challenge page,
+      // proxy error page, etc.) intercepted the request before it ever
+      // reached our backend. Surface a snippet of the raw body so the real
+      // cause is visible instead of a generic message.
+      const raw = String(response.responseText || '').trim();
+      const snippet = raw.slice(0, 200).replace(/\s+/g, ' ');
+      console.error('[mitmachim-ai-search] non-JSON response', { status: response.status, body: raw });
+      throw new Error(`שרת החיפוש החזיר תגובה לא צפויה (סטטוס ${response.status}): ${snippet || '(תגובה ריקה)'}`);
     }
     if (!payload || payload.success !== true) {
       const serverMessage = payload?.error?.message;
+      console.error('[mitmachim-ai-search] search failed', { status: response.status, payload });
       throw new Error(serverMessage || `החיפוש נכשל (סטטוס ${response.status})`);
     }
     return payload;
