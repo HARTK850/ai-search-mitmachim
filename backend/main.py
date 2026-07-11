@@ -238,11 +238,13 @@ def run_search(payload: SearchRequest) -> dict[str, Any]:
 
 
 @app.get("/health")
+@app.get("/api/health")
 def health() -> dict[str, Any]:
     return {"success": True, "service": "mitmachim-ai-search", "aiOnServer": False}
 
 
 @app.post("/search")
+@app.post("/api/search")
 def search(payload: SearchRequest) -> JSONResponse:
     try:
         body = run_search(payload)
