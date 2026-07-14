@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         חיפוש AI למתמחים טופ
 // @namespace    https://mitmachim.top/
-// @version      1.0.1
+// @version      1.0.2
 // @description  חיפוש סמנטי מוטמע במתמחים טופ, עם Gemini מקומי בדפדפן
 // @author       Mitmachim AI Search
 // @match        https://mitmachim.top/*
@@ -66,6 +66,77 @@
 
   function maskKey(key) { return key.length < 9 ? '••••••••' : `${key.slice(0, 4)}••••${key.slice(-4)}`; }
   function escapeHtml(value = '') { return String(value).replace(/[&<>'"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])); }
+
+  let maiSpoilerSeq = 0;
+  // ממיר תוכן פוסט מהפורום (HTML גולמי) לתצוגה מקדימה בטוחה,
+  // תוך שמירה על תיוגי משתמשים, ספוילרים, אימוג'ים ותמונות — כמו בעמוד החיפוש עצמו.
+  function sanitizePostHtml(sourceEl) {
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = sourceEl.innerHTML;
+
+    // תיוגי משתמשים (@שם) -> קישור לפרופיל
+    wrapper.querySelectorAll('a.plugin-mentions-a, a[href*="/user/"]').forEach((a) => {
+      const href = a.getAttribute('href') || '';
+      let url = href;
+      try { url = new URL(href, location.origin).href; } catch (_) {}
+      const text = a.textContent.trim();
+      const span = document.createElement('a');
+      span.className = 'mai-mention';
+      span.href = url;
+      span.target = '_blank';
+      span.rel = 'noopener';
+      span.textContent = text || '@';
+      a.replaceWith(span);
+    });
+
+    // ספוילרים -> כפתור פתיחה/סגירה עצמאי (לא תלוי ב-Bootstrap collapse של האתר המארח)
+    wrapper.querySelectorAll('.extended-markdown-spoiler').forEach((button) => {
+      const targetSel = button.getAttribute('data-bs-target');
+      const targetId = targetSel ? targetSel.replace('#', '') : '';
+      const collapseEl = targetId ? wrapper.querySelector(`#${CSS.escape(targetId)}`) : button.nextElementSibling;
+      const bodyHtml = collapseEl ? collapseEl.innerHTML : '';
+      maiSpoilerSeq += 1;
+      const id = `mai-spoiler-${maiSpoilerSeq}`;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'mai-spoiler-btn';
+      btn.dataset.spoilerToggle = id;
+      btn.innerHTML = '<i class="fa fa-eye"></i> ספוילר';
+      const body = document.createElement('div');
+      body.className = 'mai-spoiler-body';
+      body.id = id;
+      body.innerHTML = bodyHtml;
+      button.replaceWith(btn, body);
+      if (collapseEl && collapseEl.parentNode) collapseEl.remove();
+    });
+
+    // תמונות ואימוג'ים — מציבים class לעיצוב, שאר התמונות מוגבלות לרוחב
+    wrapper.querySelectorAll('img').forEach((img) => {
+      if (img.classList.contains('emoji')) {
+        img.classList.add('mai-post-emoji');
+      } else {
+        img.classList.add('mai-post-img');
+        img.removeAttribute('style');
+      }
+      img.removeAttribute('loading');
+    });
+
+    // קישורים רגילים (לא תיוגים) -> נפתחים בטאב חדש, בלי לעקוב
+    wrapper.querySelectorAll('a:not(.mai-mention)').forEach((a) => {
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer nofollow ugc';
+    });
+
+    // הסרת אלמנטים/תכונות מסוכנים (script, event handlers וכו')
+    wrapper.querySelectorAll('script, style, iframe, object, embed').forEach((el) => el.remove());
+    wrapper.querySelectorAll('*').forEach((el) => {
+      [...el.attributes].forEach((attr) => {
+        if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
+      });
+    });
+
+    return wrapper.innerHTML.trim();
+  }
   function cleanJson(text) { const match = text.replace(/```(?:json)?/g, '').trim().match(/\{[\s\S]*\}/); if (!match) throw new Error('Gemini returned invalid JSON'); return JSON.parse(match[0]); }
 
   class KeyManager {
@@ -118,15 +189,27 @@
 פורמט: {"queries":["..."],"possibleTitles":["..."]}`, signal);
   }
 
-  async function explainResults(query, results, keyManager, signal) {
+  async function explainResults(query, results, keyManager, signal, onProgress) {
     if (!results.length) return results;
-    const compact = results.slice(0, 24).map((r, i) => ({ i, title: r.title, snippet: r.snippet })).map(JSON.stringify).join('\n');
-    try {
-      const data = await keyManager.call(`השאלה: "${query}". כתוב הסבר עברי עובדתי וקצר בן 2-3 שורות לכל תוצאה, רק לפי הכותרת והתקציר. החזר {"items":[{"i":0,"explanation":"..."}]}.
+    const BATCH_SIZE = 24;
+    const explanations = new Array(results.length).fill('');
+    const batches = [];
+    for (let start = 0; start < results.length; start += BATCH_SIZE) batches.push(results.slice(start, start + BATCH_SIZE));
+    for (let b = 0; b < batches.length; b += 1) {
+      const batch = batches[b];
+      const offset = b * BATCH_SIZE;
+      const compact = batch.map((r, i) => ({ i, title: r.title, snippet: r.snippet })).map(JSON.stringify).join('\n');
+      try {
+        const data = await keyManager.call(`השאלה: "${query}". כתוב הסבר עברי עובדתי וקצר בן 2-3 שורות לכל תוצאה, רק לפי הכותרת והתקציר. החזר {"items":[{"i":0,"explanation":"..."}]}.
 ${compact}`, signal);
-      const map = new Map((data.items || []).map((item) => [Number(item.i), String(item.explanation || '')]));
-      return results.map((result, index) => ({ ...result, explanation: map.get(index) || '' }));
-    } catch (_) { return results; }
+        (data.items || []).forEach((item) => {
+          const idx = offset + Number(item.i);
+          if (idx >= 0 && idx < explanations.length) explanations[idx] = String(item.explanation || '');
+        });
+      } catch (_) { /* ממשיכים לאצווה הבאה גם אם אחת נכשלה */ }
+      if (onProgress) onProgress(Math.min(offset + batch.length, results.length), results.length);
+    }
+    return results.map((result, index) => ({ ...result, explanation: explanations[index] || '' }));
   }
 
   // ─── Search engine (runs entirely in the browser, no server needed) ──────────
@@ -170,7 +253,7 @@ ${compact}`, signal);
           merged.set(key, { ...r, sources: [r.source] });
         } else {
           const cur = merged.get(key);
-          if ((r.snippet || '').length > (cur.snippet || '').length) cur.snippet = r.snippet;
+          if ((r.snippet || '').length > (cur.snippet || '').length) { cur.snippet = r.snippet; if (r.snippetHtml) cur.snippetHtml = r.snippetHtml; }
           if (!cur.sources.includes(r.source)) cur.sources.push(r.source);
         }
       }
@@ -207,15 +290,19 @@ ${compact}`, signal);
         const m = href.match(/\/post\/(\d+)/);
         if (!m || seen.has(m[1])) continue;
         seen.add(m[1]);
-        // תוכן הפוסט
+        // תוכן הפוסט — שומרים גם טקסט נקי (לניקוד/AI) וגם HTML מעוצב (לתצוגה)
         const contentEl = li.querySelector('[component="post/content"]');
         const snippet = contentEl ? contentEl.textContent.replace(/\s+/g, ' ').trim().slice(0, 300) : '';
+        const snippetHtml = contentEl ? sanitizePostHtml(contentEl) : '';
         // שם משתמש
         const authorEl = li.querySelector('.post-author a.fw-semibold');
         const author = authorEl ? authorEl.textContent.trim() : '';
-        // תאריך
+        const authorUrlEl = li.querySelector('.post-author a[href*="/user/"]');
+        const authorUrl = authorUrlEl ? new URL(authorUrlEl.getAttribute('href'), location.origin).href : '';
+        // תאריך — כמו בפורום עצמו: טקסט יחסי ("לפני 6 ימים") עם התאריך המדויק כ-title
         const timeEl = li.querySelector('.timeago');
-        const date = timeEl ? (timeEl.getAttribute('title') || timeEl.textContent.trim()).replace(/^(\d+)\s+(ב\S+)\s+(\d+),\s*(.+)$/, '$1 $2 $3') : '';
+        const date = timeEl ? timeEl.textContent.trim() : '';
+        const dateTitle = timeEl ? (timeEl.getAttribute('title') || '') : '';
         // קטגוריה
         const catEl = li.querySelector('[component="topic/category"]');
         const category = catEl ? catEl.textContent.replace(/\s+/g, ' ').trim() : '';
@@ -223,8 +310,11 @@ ${compact}`, signal);
           title,
           url: new URL(href, location.origin).href,
           snippet,
+          snippetHtml,
           author,
+          authorUrl,
           date,
+          dateTitle,
           category,
           source: 'מתמחים טופ'
         });
@@ -281,12 +371,165 @@ ${compact}`, signal);
   }
 
 
+  // ─── תמלול קולי לשדה החיפוש ───────────────────────────────────────────────
+  // הלוגיקה מבוססת על הסקריפט "Universal Voice to Text": מאזינים ל-SpeechRecognition,
+  // מציגים תוצאת ביניים (interim) בשדה בזמן אמת, ובסיום מציבים את הטקסט הסופי.
+  // כדי שהתמלול לא "יבלע" תחילת/סוף מילים, מתחילים להאזין כבר לפני שהמשתמש
+  // מתחיל לדבר (איפוס דיבאונס) ומחכים שנייה נוספת אחרי לחיצת העצירה לפני שסוגרים
+  // את ההאזנה בפועל — כך נשמר "כרית שקט" של כשנייה בכל צד של ההקלטה בפועל.
+  const voiceDictation = (() => {
+    const SILENCE_PAD_MS = 1000;
+    let recognition = null;
+    let listening = false;
+    let stopTimer = null;
+    let targetInput = null;
+    let targetButton = null;
+    let baseValue = '';
+    let finalTranscript = '';
+
+    function supported() {
+      return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+    }
+
+    function ctor() {
+      return window.SpeechRecognition || window.webkitSpeechRecognition;
+    }
+
+    function detectLang() {
+      // הפורום עברי — ברירת מחדל עברית, אלא אם הדפדפן מוגדר אחרת במפורש לאנגלית
+      const nav = (navigator.language || 'he-IL');
+      return /^en/i.test(nav) ? 'en-US' : 'he-IL';
+    }
+
+    function setButtonState(recording) {
+      if (!targetButton) return;
+      targetButton.classList.toggle('mai-mic-recording', recording);
+      targetButton.setAttribute('aria-pressed', recording ? 'true' : 'false');
+      targetButton.title = recording ? 'מקליט… לחצו לעצירה' : 'חיפוש בקול';
+    }
+
+    function composeValue(interim) {
+      const prefix = baseValue && !/\s$/.test(baseValue) ? ' ' : '';
+      const finalPart = finalTranscript ? `${prefix}${finalTranscript}` : '';
+      const interimPart = interim ? `${(baseValue + finalPart) && !/\s$/.test(baseValue + finalPart) ? ' ' : ''}${interim}` : '';
+      return `${baseValue}${finalPart}${interimPart}`.replace(/\s+/g, ' ').trim();
+    }
+
+    function updateInput(interim) {
+      if (!targetInput) return;
+      targetInput.value = composeValue(interim);
+    }
+
+    function start(button, input) {
+      if (listening) return;
+      if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
+      targetButton = button;
+      targetInput = input;
+      baseValue = (input.value || '').trim();
+      finalTranscript = '';
+
+      const Recognition = ctor();
+      recognition = new Recognition();
+      recognition.lang = detectLang();
+      recognition.interimResults = true;
+      recognition.continuous = true;
+      recognition.maxAlternatives = 1;
+
+      recognition.onstart = () => {
+        listening = true;
+        setButtonState(true);
+      };
+
+      recognition.onresult = (event) => {
+        let interimText = '';
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const result = event.results[i];
+          const transcript = result[0]?.transcript || '';
+          if (result.isFinal) {
+            finalTranscript = `${finalTranscript}${finalTranscript && !/\s$/.test(finalTranscript) ? ' ' : ''}${transcript.trim()}`;
+          } else {
+            interimText += transcript;
+          }
+        }
+        updateInput(interimText.trim());
+      };
+
+      recognition.onerror = (event) => {
+        if (event.error === 'no-speech' || event.error === 'aborted') return;
+        finish();
+      };
+
+      recognition.onend = () => {
+        // אם עדיין לא ביקשו לעצור (למשל דפדפן שסוגר session מעצמו), ננסה להמשיך להאזין
+        if (listening && !stopTimer) {
+          try { recognition.start(); return; } catch (_) {}
+        }
+        listening = false;
+        recognition = null;
+        setButtonState(false);
+        updateInput('');
+        if (targetInput) {
+          targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+          targetInput.focus();
+        }
+      };
+
+      try {
+        recognition.start();
+      } catch (_) {
+        setButtonState(false);
+      }
+    }
+
+    function finish() {
+      // "כרית שקט" בסוף: ממתינים עוד שנייה אחרי לחיצת העצירה לפני שסוגרים את
+      // ההאזנה בפועל, כדי לא לחתוך את סוף המילה/המשפט האחרון.
+      if (!listening || stopTimer) return;
+      setButtonState(false);
+      stopTimer = setTimeout(() => {
+        stopTimer = null;
+        listening = false;
+        if (recognition) { try { recognition.stop(); } catch (_) {} }
+      }, SILENCE_PAD_MS);
+    }
+
+    function toggle(button, input) {
+      if (!supported()) return;
+      if (listening) finish();
+      else start(button, input);
+    }
+
+    return { supported, toggle };
+  })();
+
   function styles() {
     const style = document.createElement('style');
     style.id = 'mai-styles';
     style.textContent = `
-.mai-icon{width:20px;height:20px;object-fit:cover;border-radius:50%;display:block}
-.mai-icon-heading{width:24px;height:24px}
+.mai-icon{width:34px;height:34px;object-fit:cover;border-radius:50%;display:block;flex:0 0 auto}
+.mai-icon-heading{width:44px;height:44px}
+.mai-search-link-ready{display:inline-flex!important;align-items:center;justify-content:center;width:34px;height:34px;flex:0 0 34px;padding:0!important;overflow:visible!important}
+.mai-mic-btn{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:50%;border:1px solid #d7dde3;background:#fff;color:#36434f;cursor:pointer;flex:0 0 auto;transition:background .15s,color .15s,box-shadow .15s}
+.mai-mic-btn:hover{background:#f1f5f9}
+.mai-mic-btn.mai-mic-recording{background:#d93025;border-color:#d93025;color:#fff;box-shadow:0 0 0 4px rgba(217,48,37,.15);animation:mai-mic-pulse 1.2s infinite}
+.mai-mic-btn svg{width:18px;height:18px;fill:currentColor;pointer-events:none}
+@keyframes mai-mic-pulse{0%{box-shadow:0 0 0 0 rgba(217,48,37,.35)}70%{box-shadow:0 0 0 8px rgba(217,48,37,0)}100%{box-shadow:0 0 0 0 rgba(217,48,37,0)}}
+.mai-mention{color:#1976ed;text-decoration:none;font-weight:600}
+.mai-mention:hover{text-decoration:underline}
+.mai-spoiler-btn{background:#1976ed;color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin:4px 0}
+.mai-spoiler-btn:hover{background:#1462c4}
+.mai-spoiler-body{display:none;margin:6px 0;padding:8px 10px;background:#f5f8fc;border-radius:6px;border:1px solid #e1e8ef}
+.mai-spoiler-body.open{display:block}
+.mai-post-emoji{height:20px;width:auto;vertical-align:middle}
+.mai-post-img{max-width:100%;border-radius:4px;margin:4px 0}
+.mai-content-preview{max-height:225px;overflow-y:auto;position:relative;padding-inline-end:4px;scrollbar-width:thin;scrollbar-color:#a9c6ef #eaf1fb}
+.mai-content-preview::-webkit-scrollbar{width:6px}
+.mai-content-preview::-webkit-scrollbar-track{background:#eaf1fb;border-radius:4px}
+.mai-content-preview::-webkit-scrollbar-thumb{background:#a9c6ef;border-radius:4px}
+.mai-content-preview::-webkit-scrollbar-thumb:hover{background:#7fb0e8}
+.mai-content-preview p{margin:0 0 6px}
+.mai-content-fade{position:relative}
+.mai-content-fade::after{content:'';position:absolute;left:0;right:0;bottom:0;height:22px;background:linear-gradient(to bottom,rgba(255,255,255,0),rgba(255,255,255,.92));pointer-events:none;border-radius:0 0 4px 4px}
 .mai-explain{font-size:14px;margin-top:8px;padding:8px;background:#f5f8fc;border-radius:4px;color:#36434f}
 .mai-empty{text-align:center;padding:40px 20px;color:#71808d}
 .mai-skeleton{height:70px;border-radius:6px;margin-bottom:10px;background:linear-gradient(90deg,#eef1f4 25%,#e4e8ec 37%,#eef1f4 63%);background-size:400% 100%;animation:mai-shimmer 1.4s ease infinite}
@@ -367,6 +610,9 @@ ${compact}`, signal);
     body.innerHTML = `<form id="mai-form" class="d-flex flex-column gap-3">
 <div class="d-flex flex-wrap gap-2">
 <input id="mai-query" class="form-control fw-semibold py-2 ps-2 pe-3" style="min-width:0;flex:1 1 260px;" aria-label="מה תרצו למצוא" placeholder="לדוגמה: תוכנה לחסימת פרסומות באנדרואיד" value="${escapeHtml(state.query)}">
+<button type="button" class="mai-mic-btn" id="mai-mic-btn" title="חיפוש בקול" aria-label="חיפוש בקול" aria-pressed="false">
+<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3.75 3.75 0 0 0 3.75-3.75V6.75a3.75 3.75 0 1 0-7.5 0v4.5A3.75 3.75 0 0 0 12 15Zm6-3.75a.75.75 0 0 1 1.5 0A7.5 7.5 0 0 1 12.75 18.7V21a.75.75 0 0 1-1.5 0v-2.3A7.5 7.5 0 0 1 4.5 11.25a.75.75 0 0 1 1.5 0 6 6 0 0 0 12 0Z"></path></svg>
+</button>
 <button class="btn btn-primary fw-semibold px-3" type="submit">חיפוש</button>
 <button class="btn btn-light border" type="button" id="mai-cancel" hidden>ביטול</button>
 </div>
@@ -395,6 +641,18 @@ ${recentQueries.length ? `
     body.querySelector('#mai-form').addEventListener('submit', (event) => { event.preventDefault(); const q = body.querySelector('#mai-query').value; if (isAiSearchUrl()) history.replaceState({ maiSearch: true }, '', buildAiSearchUrl(q)); run(q); });
     body.querySelector('#mai-cancel').addEventListener('click', () => state.controller?.abort());
     body.querySelector('#mai-explain').addEventListener('change', (e) => { storage.update({ explain: e.target.checked }); });
+
+    const micBtn = body.querySelector('#mai-mic-btn');
+    if (micBtn) {
+      if (!voiceDictation.supported()) {
+        micBtn.disabled = true;
+        micBtn.title = 'הדפדפן לא תומך בתמלול קולי';
+        micBtn.style.opacity = '0.5';
+        micBtn.style.cursor = 'not-allowed';
+      } else {
+        micBtn.addEventListener('click', () => voiceDictation.toggle(micBtn, body.querySelector('#mai-query')));
+      }
+    }
 
     const historyToggle = body.querySelector('#mai-history-toggle');
     const historyPanel = body.querySelector('#mai-history-panel');
@@ -477,7 +735,12 @@ ${recentQueries.length ? `
         page++;
       }
       state.results = [...merged.values()].sort((a, b) => b.score - a.score);
-      if (settings.explain) { status.textContent = 'Gemini מוסיף הסברים לתוצאות…'; state.results = await explainResults(query, state.results, manager, state.controller.signal); }
+      if (settings.explain) {
+        status.textContent = 'Gemini מוסיף הסברים לתוצאות…';
+        state.results = await explainResults(query, state.results, manager, state.controller.signal, (done, total) => {
+          status.textContent = `Gemini מוסיף הסברים לתוצאות… (${done}/${total})`;
+        });
+      }
       const fresh = storage.get(); const historyList = [query, ...fresh.history.filter((item) => item !== query)].slice(0, 10); const cache = { ...fresh.cache, [cacheKey]: { at: Date.now(), results: state.results, plans: queries } };
       Object.keys(cache).forEach((key) => { if (Date.now() - cache[key].at > CACHE_TTL) delete cache[key]; }); storage.update({ history: historyList, cache, explain: body.querySelector('#mai-explain').checked });
       renderResults(); status.textContent = `נמצאו ${state.results.length} תוצאות ייחודיות`;
@@ -500,12 +763,14 @@ ${recentQueries.length ? `
 <div class="d-flex gap-2 post-info text-sm align-items-center">
 ${item.author ? `<div class="post-author d-flex align-items-center gap-1">
 <span class="avatar not-responsive avatar-rounded" style="--avatar-size:16px;width:16px;height:16px;border-radius:50%;background-color:#1976ed;color:#fff;font-size:10px;display:inline-flex;align-items:center;justify-content:center;">${escapeHtml((item.author || 'מ').trim().charAt(0))}</span>
-<span class="fw-semibold">${escapeHtml(item.author)}</span>
+${item.authorUrl ? `<a class="fw-semibold text-reset text-decoration-none" href="${escapeHtml(item.authorUrl)}" target="_blank" rel="noopener">${escapeHtml(item.author)}</a>` : `<span class="fw-semibold">${escapeHtml(item.author)}</span>`}
 </div>` : ''}
-${item.date ? `<span class="timeago text-muted lh-1">${escapeHtml(item.date)}</span>` : ''}
+${item.date ? `<span class="timeago text-muted lh-1"${item.dateTitle ? ` title="${escapeHtml(item.dateTitle)}"` : ''}>${escapeHtml(item.date)}</span>` : ''}
 </div>
 <div class="content text-sm text-break" component="post/content">
-<p dir="auto">${escapeHtml(item.snippet || 'לחצו לפתיחת הנושא במתמחים טופ')}</p>
+<div class="mai-content-preview mai-content-fade">
+${item.snippetHtml ? `<div dir="auto">${item.snippetHtml}</div>` : `<p dir="auto">${escapeHtml(item.snippet || 'לחצו לפתיחת הנושא במתמחים טופ')}</p>`}
+</div>
 ${item.explanation ? `<p dir="auto" class="mai-explain"><strong>הסבר AI:</strong> ${escapeHtml(item.explanation)}</p>` : ''}
 </div>
 </div>
@@ -516,12 +781,17 @@ ${(item.sources || []).map((source) => `<span class="badge px-1 text-truncate bo
 </li>`).join('');
     container.innerHTML = `<ul component="posts" class="posts-list list-unstyled">${cards}</ul><nav class="mai-pager d-flex gap-2 justify-content-center mt-3 pt-3 border-top" aria-label="עמודי תוצאות">${Array.from({ length: totalPages }, (_, i) => `<button class="btn btn-sm ${i + 1 === state.page ? 'btn-primary' : 'btn-light border'} mai-page" data-page="${i + 1}">${i + 1}</button>`).join('')}</nav>`;
     container.querySelectorAll('[data-page]').forEach((button) => button.addEventListener('click', () => { state.page = Number(button.dataset.page); renderResults(); getContentEl()?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }));
+    container.querySelectorAll('[data-spoiler-toggle]').forEach((button) => button.addEventListener('click', () => {
+      const body = container.querySelector(`#${CSS.escape(button.dataset.spoilerToggle)}`);
+      if (body) body.classList.toggle('open');
+    }));
   }
 
   function enhanceSearchLink() {
     document.querySelectorAll('a.advanced-search-link').forEach((link) => {
       if (link.dataset.maiReady) return;
       link.dataset.maiReady = 'true';
+      link.classList.add('mai-search-link-ready');
       const oldIcon = link.querySelector('i.fa.fa-gears, i.fa-gears');
       if (oldIcon) { const image = document.createElement('img'); image.className = 'mai-icon'; image.src = ICON_URL; image.alt = ''; oldIcon.replaceWith(image); }
       link.setAttribute('title', 'חיפוש AI מתקדם'); link.setAttribute('href', buildAiSearchUrl());
