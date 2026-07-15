@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         חיפוש AI למתמחים טופ
 // @namespace    https://mitmachim.top/
-// @version      1.0.2
+// @version      1.0.1
 // @description  חיפוש סמנטי מוטמע במתמחים טופ, עם Gemini מקומי בדפדפן
 // @author       Mitmachim AI Search
 // @match        https://mitmachim.top/*
@@ -189,7 +189,7 @@
 פורמט: {"queries":["..."],"possibleTitles":["..."]}`, signal);
   }
 
-  async function explainResults(query, results, keyManager, signal, onProgress) {
+  async function explainResults(query, results, keyManager, signal, onProgress, onItemExplained) {
     if (!results.length) return results;
     const BATCH_SIZE = 24;
     const explanations = new Array(results.length).fill('');
@@ -204,7 +204,10 @@
 ${compact}`, signal);
         (data.items || []).forEach((item) => {
           const idx = offset + Number(item.i);
-          if (idx >= 0 && idx < explanations.length) explanations[idx] = String(item.explanation || '');
+          if (idx >= 0 && idx < explanations.length) {
+            explanations[idx] = String(item.explanation || '');
+            if (onItemExplained) onItemExplained({ ...results[idx], explanation: explanations[idx] });
+          }
         });
       } catch (_) { /* ממשיכים לאצווה הבאה גם אם אחת נכשלה */ }
       if (onProgress) onProgress(Math.min(offset + batch.length, results.length), results.length);
@@ -360,7 +363,40 @@ ${compact}`, signal);
     } catch (err) { console.warn('[mitmachim-ai-search] DuckDuckGo failed', err); return []; }
   }
 
-  // Main: runs both sources in parallel per query, merges and scores locally.
+  // גרסה סטרימינג: כל שאילתה מתבצעת במקביל, ומיד כשהיא מסתיימת (עמוד ראשון,
+  // ובמידת הצורך גם עמודים נוספים) מדווחים החוצה על התוצאות החדשות שהתקבלו ממנה
+  // דרך onBatch, בלי להמתין לשאר השאילתות. onBatch מקבל מערך פריטים בודדים
+  // (לא ממוינים מחדש מול מה שכבר הוצג) — הקריאה מציבה אותם, ואילו מיון/דירוג
+  // פנימי בין הפריטים בתוך אותה אצווה עדיין מתבצע לפי relevanceScore.
+  async function streamSearch(queries, signal, onBatch) {
+    const seen = new Set();
+    let total = 0;
+
+    async function runQuery(q) {
+      let staleRounds = 0;
+      for (let page = 1; page <= 3 && staleRounds < 2 && !signal?.aborted; page += 1) {
+        const [forum, ddg] = await Promise.all([forumSearch(q, page), duckduckgoSearch(q, page, signal)]);
+        const combined = [...forum, ...ddg];
+        if (!combined.length) { staleRounds += 1; continue; }
+        const scored = combined
+          .map((item) => ({ ...item, score: relevanceScore(item, [q]) }))
+          .sort((a, b) => b.score - a.score);
+        const fresh = [];
+        for (const item of scored) {
+          const key = canonicalKey(item.url);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          fresh.push({ ...item, sources: [item.source], matchedQueries: [q] });
+        }
+        if (fresh.length) { total += fresh.length; onBatch(fresh, total); staleRounds = 0; }
+        else staleRounds += 1;
+      }
+    }
+
+    await Promise.all(queries.map(runQuery));
+  }
+
+  // Main: runs both sources in parallel per query, merges and scores locally (שימוש לא-סטרימינג, לדוגמה טעינה מהמטמון).
   async function localSearch(queries, page, signal) {
     const groups = await Promise.all(queries.map(async (q) => {
       const [forum, ddg] = await Promise.all([forumSearch(q, page), duckduckgoSearch(q, page, signal)]);
@@ -720,41 +756,54 @@ ${recentQueries.length ? `
     const settings = storage.get(); if (!settings.keys.length) return renderSettings();
     state.busy = true; state.query = query; state.page = 1; state.controller = new AbortController();
     const body = document.getElementById('mai-body'); const results = body.querySelector('#mai-results'); const cancel = body.querySelector('#mai-cancel'); const status = body.querySelector('#mai-status');
-    cancel.hidden = false; results.innerHTML = '<div class="mai-skeleton"></div><div class="mai-skeleton"></div><div class="mai-skeleton"></div>'; status.textContent = 'Gemini מתכנן את החיפוש…';
+    cancel.hidden = false; results.innerHTML = '<div class="mai-empty mai-searching" id="mai-searching-hint">מחפש תוצאות ראשונות…</div>'; state.results = []; status.textContent = 'Gemini מתכנן את החיפוש…';
     try {
       const cacheKey = query.toLowerCase(); const cached = settings.cache[cacheKey];
       if (cached && Date.now() - cached.at < CACHE_TTL) { state.results = cached.results; state.plans = cached.plans; renderResults(); status.textContent = 'התוצאות נטענו מהמטמון המקומי'; return; }
       const manager = new KeyManager(settings.keys); const plan = await planSearch(query, manager, state.controller.signal);
       const queries = [...new Set([query, ...(plan.queries || []), ...(plan.possibleTitles || [])])].filter(Boolean).slice(0, 12); state.plans = queries;
       status.textContent = `מחפש ${queries.length} וריאציות במתמחים טופ…`;
-      let page = 1, staleRounds = 0; const merged = new Map();
-      while (page <= 3 && staleRounds < 2) {
-        const response = await localSearch(queries, page, state.controller.signal); const before = merged.size;
-        response.results.forEach((item) => merged.set(item.url, item));
-        staleRounds = merged.size === before ? staleRounds + 1 : 0;
-        page++;
+
+      // ─── שלב 1: חיפוש בסטרימינג — כל שאילתה מדווחת תוצאות מיד כשהן מוכנות ───
+      // תוצאות חדשות מתווספות לסוף state.results בדיוק בסדר קבלתן; תוצאות
+      // שכבר הוצגו למשתמש לעולם לא זזות ממקומן, גם אם שאילתה מאוחרת יותר
+      // תניב תוצאה עם ציון גבוה יותר.
+      await streamSearch(queries, state.controller.signal, (freshItems, totalSoFar) => {
+        if (state.controller.signal.aborted) return;
+        state.results.push(...freshItems);
+        appendResultCards(freshItems);
+        status.textContent = `נמצאו ${totalSoFar} תוצאות עד כה…`;
+      });
+
+      if (state.controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+      if (!state.results.length) {
+        renderResults();
+        status.textContent = 'לא נמצאו תוצאות';
+      } else {
+        status.textContent = `נמצאו ${state.results.length} תוצאות ייחודיות`;
       }
-      state.results = [...merged.values()].sort((a, b) => b.score - a.score);
-      if (settings.explain) {
-        status.textContent = 'Gemini מוסיף הסברים לתוצאות…';
-        state.results = await explainResults(query, state.results, manager, state.controller.signal, (done, total) => {
-          status.textContent = `Gemini מוסיף הסברים לתוצאות… (${done}/${total})`;
-        });
+
+      // ─── שלב 2: הסברי Gemini בסטרימינג — כל הסבר מודבק לכרטיס שלו מיד כשמוכן ───
+      if (settings.explain && state.results.length) {
+        status.textContent = `נמצאו ${state.results.length} תוצאות · Gemini מייצר הסברים…`;
+        state.results = await explainResults(query, state.results, manager, state.controller.signal,
+          (done, total) => { status.textContent = `נמצאו ${state.results.length} תוצאות · מייצר הסבר… (${done}/${total})`; },
+          (item) => { patchExplanation(item); }
+        );
       }
+
       const fresh = storage.get(); const historyList = [query, ...fresh.history.filter((item) => item !== query)].slice(0, 10); const cache = { ...fresh.cache, [cacheKey]: { at: Date.now(), results: state.results, plans: queries } };
       Object.keys(cache).forEach((key) => { if (Date.now() - cache[key].at > CACHE_TTL) delete cache[key]; }); storage.update({ history: historyList, cache, explain: body.querySelector('#mai-explain').checked });
-      renderResults(); status.textContent = `נמצאו ${state.results.length} תוצאות ייחודיות`;
+      status.textContent = `נמצאו ${state.results.length} תוצאות ייחודיות`;
     } catch (error) {
-      if (error.name === 'AbortError') { results.innerHTML = '<div class="mai-empty">החיפוש בוטל.</div>'; status.textContent = 'החיפוש בוטל'; }
+      if (error.name === 'AbortError') { results.innerHTML = state.results.length ? results.innerHTML : '<div class="mai-empty">החיפוש בוטל.</div>'; status.textContent = 'החיפוש בוטל'; }
       else { results.innerHTML = `<div class="mai-empty"><strong>${escapeHtml(error.message)}</strong><br><button class="btn btn-primary btn-sm mt-2" id="mai-retry">ניסיון חוזר</button></div>`; results.querySelector('#mai-retry').addEventListener('click', () => run(query)); status.textContent = 'אירעה שגיאה'; }
     } finally { state.busy = false; cancel.hidden = true; }
   }
 
-  function renderResults() {
-    const container = document.getElementById('mai-results'); if (!container) return;
-    if (!state.results.length) { container.innerHTML = '<div class="mai-empty"><strong>לא נמצאו תוצאות</strong><p>נסו לנסח את הבקשה אחרת או להרחיב את מילות החיפוש.</p></div>'; return; }
-    const totalPages = Math.ceil(state.results.length / PAGE_SIZE); state.page = Math.min(state.page, totalPages); const start = (state.page - 1) * PAGE_SIZE;
-    const cards = state.results.slice(start, start + PAGE_SIZE).map((item) => `<li class="posts-list-item" component="post">
+  function buildResultCard(item) {
+    return `<li class="posts-list-item" component="post" data-url="${escapeHtml(item.url)}">
 <hr>
 <a class="topic-title fw-semibold fs-5 mb-2 text-reset text-break d-block" href="${escapeHtml(item.url)}" target="_blank" rel="noopener">
 <i class="fa fa-book text-muted" title="נושא"></i> ${escapeHtml(item.title)}
@@ -771,20 +820,81 @@ ${item.date ? `<span class="timeago text-muted lh-1"${item.dateTitle ? ` title="
 <div class="mai-content-preview mai-content-fade">
 ${item.snippetHtml ? `<div dir="auto">${item.snippetHtml}</div>` : `<p dir="auto">${escapeHtml(item.snippet || 'לחצו לפתיחת הנושא במתמחים טופ')}</p>`}
 </div>
-${item.explanation ? `<p dir="auto" class="mai-explain"><strong>הסבר AI:</strong> ${escapeHtml(item.explanation)}</p>` : ''}
+<div class="mai-explain-slot">${item.explanation ? `<p dir="auto" class="mai-explain"><strong>הסבר AI:</strong> ${escapeHtml(item.explanation)}</p>` : ''}</div>
 </div>
 </div>
 <div class="mb-3 d-flex flex-wrap gap-1 w-100">
 ${item.category ? `<a class="badge px-1 text-truncate text-decoration-none border" style="max-width:70vw;">${escapeHtml(item.category)}</a>` : ''}
 ${(item.sources || []).map((source) => `<span class="badge px-1 text-truncate border text-sm">${escapeHtml(source)}</span>`).join('')}
 </div>
-</li>`).join('');
+</li>`;
+  }
+
+  function bindResultCardEvents(container) {
+    container.querySelectorAll('[data-spoiler-toggle]').forEach((button) => {
+      if (button.dataset.maiBound) return;
+      button.dataset.maiBound = '1';
+      button.addEventListener('click', () => {
+        const body = container.querySelector(`#${CSS.escape(button.dataset.spoilerToggle)}`);
+        if (body) body.classList.toggle('open');
+      });
+    });
+  }
+
+  // רינדור מלא (עמוד חדש שנבחר, או תוצאות שנטענו מהמטמון) — מציג עמוד יחיד לפי state.page.
+  function renderResults() {
+    const container = document.getElementById('mai-results'); if (!container) return;
+    if (!state.results.length) { container.innerHTML = '<div class="mai-empty"><strong>לא נמצאו תוצאות</strong><p>נסו לנסח את הבקשה אחרת או להרחיב את מילות החיפוש.</p></div>'; return; }
+    const totalPages = Math.ceil(state.results.length / PAGE_SIZE); state.page = Math.min(state.page, totalPages); const start = (state.page - 1) * PAGE_SIZE;
+    const cards = state.results.slice(start, start + PAGE_SIZE).map(buildResultCard).join('');
     container.innerHTML = `<ul component="posts" class="posts-list list-unstyled">${cards}</ul><nav class="mai-pager d-flex gap-2 justify-content-center mt-3 pt-3 border-top" aria-label="עמודי תוצאות">${Array.from({ length: totalPages }, (_, i) => `<button class="btn btn-sm ${i + 1 === state.page ? 'btn-primary' : 'btn-light border'} mai-page" data-page="${i + 1}">${i + 1}</button>`).join('')}</nav>`;
     container.querySelectorAll('[data-page]').forEach((button) => button.addEventListener('click', () => { state.page = Number(button.dataset.page); renderResults(); getContentEl()?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }));
-    container.querySelectorAll('[data-spoiler-toggle]').forEach((button) => button.addEventListener('click', () => {
-      const body = container.querySelector(`#${CSS.escape(button.dataset.spoilerToggle)}`);
-      if (body) body.classList.toggle('open');
-    }));
+    bindResultCardEvents(container);
+  }
+
+  // תוספת סטרימינג: מוסיפים רק את הפריטים החדשים לסוף הרשימה המוצגת כרגע,
+  // בלי לגעת/למיין מחדש בכרטיסים שכבר קיימים על המסך. פועל רק כשמוצג עמוד 1
+  // (בעמוד הראשון בלבד יש טעם "לראות תוצאות נכנסות" בזמן אמת); אם המשתמש כבר
+  // עבר לעמוד אחר, רק סופרים את התוצאות ברקע ומעדכנים את הפאג'ינציה בשקט.
+  function appendResultCards(newItems) {
+    const container = document.getElementById('mai-results'); if (!container) return;
+    const totalPages = Math.ceil(state.results.length / PAGE_SIZE);
+    let list = container.querySelector('ul.posts-list');
+    if (!list) {
+      // אין עדיין רשימה על המסך (למשל אחרי מסך ריק/שגיאה) — יוצרים מהתחלה
+      renderResults();
+      return;
+    }
+    if (state.page === 1) {
+      const currentCount = list.children.length;
+      const room = PAGE_SIZE - currentCount;
+      if (room > 0) {
+        const toAppend = newItems.slice(0, room);
+        list.insertAdjacentHTML('beforeend', toAppend.map(buildResultCard).join(''));
+        bindResultCardEvents(container);
+      }
+    }
+    // מעדכנים תמיד את הפאג'ינציה כדי לשקף את כמות התוצאות הכוללת שהצטברה
+    let nav = container.querySelector('.mai-pager');
+    const navHtml = `${Array.from({ length: totalPages }, (_, i) => `<button class="btn btn-sm ${i + 1 === state.page ? 'btn-primary' : 'btn-light border'} mai-page" data-page="${i + 1}">${i + 1}</button>`).join('')}`;
+    if (totalPages > 1) {
+      if (!nav) {
+        container.insertAdjacentHTML('beforeend', `<nav class="mai-pager d-flex gap-2 justify-content-center mt-3 pt-3 border-top" aria-label="עמודי תוצאות">${navHtml}</nav>`);
+        nav = container.querySelector('.mai-pager');
+      } else {
+        nav.innerHTML = navHtml;
+      }
+      nav.querySelectorAll('[data-page]').forEach((button) => button.addEventListener('click', () => { state.page = Number(button.dataset.page); renderResults(); getContentEl()?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }));
+    }
+  }
+
+  // מדביק הסבר AI לכרטיס ספציפי (לפי URL) מבלי לרנדר מחדש את שאר הרשימה.
+  function patchExplanation(item) {
+    const container = document.getElementById('mai-results'); if (!container) return;
+    const li = container.querySelector(`li[data-url="${CSS.escape(item.url)}"]`);
+    if (!li) return; // הפריט לא מוצג כרגע (בעמוד אחר) — ה-state כבר עודכן, יוצג נכון בפעם הבאה שהעמוד יירונדר
+    const slot = li.querySelector('.mai-explain-slot');
+    if (slot) slot.innerHTML = item.explanation ? `<p dir="auto" class="mai-explain"><strong>הסבר AI:</strong> ${escapeHtml(item.explanation)}</p>` : '';
   }
 
   function enhanceSearchLink() {
