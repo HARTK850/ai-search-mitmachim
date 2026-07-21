@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         חיפוש AI למתמחים טופ
 // @namespace    https://mitmachim.top/
-// @version      1.0.1
+// @version      1.0.4
 // @description  חיפוש סמנטי מוטמע במתמחים טופ, עם Gemini מקומי בדפדפן
 // @author       Mitmachim AI Search
 // @match        https://mitmachim.top/*
@@ -302,6 +302,13 @@ ${compact}`, signal);
         const author = authorEl ? authorEl.textContent.trim() : '';
         const authorUrlEl = li.querySelector('.post-author a[href*="/user/"]');
         const authorUrl = authorUrlEl ? new URL(authorUrlEl.getAttribute('href'), location.origin).href : '';
+        // אווטאר אמיתי — תמונת פרופיל אם קיימת, אחרת הצבע והאות האמיתיים של המשתמש בפורום
+        const avatarImgEl = li.querySelector('.post-author img[component="avatar/picture"]');
+        const avatarIconEl = li.querySelector('.post-author span[component="avatar/icon"]');
+        const authorAvatarUrl = avatarImgEl ? new URL(avatarImgEl.getAttribute('src'), location.origin).href : '';
+        const authorColorMatch = avatarIconEl ? (avatarIconEl.getAttribute('style') || '').match(/background-color:\s*([^;]+)/i) : null;
+        const authorColor = authorColorMatch ? authorColorMatch[1].trim() : '';
+        const authorInitial = avatarIconEl ? avatarIconEl.textContent.trim() : (author ? author.trim().charAt(0) : '');
         // תאריך — כמו בפורום עצמו: טקסט יחסי ("לפני 6 ימים") עם התאריך המדויק כ-title
         const timeEl = li.querySelector('.timeago');
         const date = timeEl ? timeEl.textContent.trim() : '';
@@ -316,6 +323,9 @@ ${compact}`, signal);
           snippetHtml,
           author,
           authorUrl,
+          authorAvatarUrl,
+          authorColor,
+          authorInitial,
           date,
           dateTitle,
           category,
@@ -811,7 +821,9 @@ ${recentQueries.length ? `
 <div class="post-body d-flex flex-column gap-1 mb-2">
 <div class="d-flex gap-2 post-info text-sm align-items-center">
 ${item.author ? `<div class="post-author d-flex align-items-center gap-1">
-<span class="avatar not-responsive avatar-rounded" style="--avatar-size:16px;width:16px;height:16px;border-radius:50%;background-color:#1976ed;color:#fff;font-size:10px;display:inline-flex;align-items:center;justify-content:center;">${escapeHtml((item.author || 'מ').trim().charAt(0))}</span>
+${item.authorAvatarUrl
+    ? `<img src="${escapeHtml(item.authorAvatarUrl)}" alt="" loading="lazy" class="avatar not-responsive avatar-rounded" style="--avatar-size:16px;width:16px;height:16px;border-radius:50%;object-fit:cover;">`
+    : `<span class="avatar not-responsive avatar-rounded" style="--avatar-size:16px;width:16px;height:16px;border-radius:50%;background-color:${escapeHtml(item.authorColor || '#1976ed')};color:#fff;font-size:10px;display:inline-flex;align-items:center;justify-content:center;">${escapeHtml(item.authorInitial || (item.author || 'מ').trim().charAt(0))}</span>`}
 ${item.authorUrl ? `<a class="fw-semibold text-reset text-decoration-none" href="${escapeHtml(item.authorUrl)}" target="_blank" rel="noopener">${escapeHtml(item.author)}</a>` : `<span class="fw-semibold">${escapeHtml(item.author)}</span>`}
 </div>` : ''}
 ${item.date ? `<span class="timeago text-muted lh-1"${item.dateTitle ? ` title="${escapeHtml(item.dateTitle)}"` : ''}>${escapeHtml(item.date)}</span>` : ''}
